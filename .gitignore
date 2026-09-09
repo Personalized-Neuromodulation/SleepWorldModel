@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.codex-test-tmp/
+.venv/
+.idea/
+artifacts/
+artifacts/*.jsonl
+artifacts/*.tmp
+artifacts/checkpoints/
+artifacts/wandb/
+*.egg-info/
+.ipynb_checkpoints/
+tests/data/
+artifacts/backbone/

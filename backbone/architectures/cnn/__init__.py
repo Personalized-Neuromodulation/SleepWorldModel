@@ -1,0 +1,1 @@
+"""CNN sequence architecture family."""
