@@ -1,385 +1,182 @@
-# PSG Backbone 实现规格
+# PSG foundation backbone 与模态预测预训练
 
-版本：v15，第一版 backbone 已实现。入口为 `build_backbone(config, signal_batch)`，配置见 [base.yaml](../configs/backbone/base.yaml)，逐步验证见 [Jupyter notebook](../notebooks/backbone_step_by_step.ipynb)。Fast/Slow、长程编码、MoE、JEPA、对比学习、codebook 和世界模型训练仍为后续范围。
+用户已批准实现本轮方案并训练 10K，每 1K 评价。输入范围仍为单个 30 秒 epoch。
+`data_preprocess/**` 冻结。所有改动复用原 backbone、数据契约、HF API 和训练入口。
 
-## 1. 包边界与文件树
-
-```text
-dataloader/                         # 数据读取、对齐、QC、adapter、SignalBatch
-├── signals.py                     # SignalBatch/SignalGroup、as_signal_batch
-└── synthetic.py                   # notebook 和测试用合成窗口
-
-backbone/                           # SignalBatch → 连续 PSG 表示
-├── __init__.py                     # 公共导出
-├── configuration.py                # BackboneConfig 与组合校验
-├── contracts.py                    # 内部状态、MaskPlan、各级输出
-├── factory.py                      # 构建并注入 architecture/modeling 实例
-├── architectures/                  # 通用序列算法，不识别 PSG 业务轴
-│   ├── sequence.py                 # 通用 mask 和依赖区间传播
-│   ├── cnn/
-│   │   ├── configuration.py        # CNNConfig
-│   │   └── modeling.py             # CNNSequenceBlock
-│   └── transformer/
-│       ├── configuration.py        # TransformerConfig、FFN 配方
-│       ├── modeling.py             # Attention、FFN、Sequence/CrossAttentionBlock
-│       └── modeling_moe.py         # 后续：MoE FFN，第一版不创建
-└── modeling/                       # PSG 编码职责与组合
-    ├── pooling.py                  # patch/通道/模态共用的安全汇聚与位置编码
-    ├── patching.py                 # Patchifier 与 PatchLayout
-    ├── masking.py                  # 执行 waveform/token MaskPlan
-    ├── patch_encoder.py            # 单 patch 编码
-    ├── patch_sequence_encoder.py   # patch 序列编码
-    ├── channel_aggregator.py       # 通道身份与通道汇聚
-    ├── fusion.py                   # 模态身份、时间对齐与融合
-    ├── signal_encoder.py           # 单编码组流程
-    ├── modality_encoder.py         # 单模态流程
-    └── psg_backbone.py             # 多模态总入口
-
-tokenization/                       # 可选离散 tokenizer，不属于 backbone
-└── codebook/
-    ├── configuration.py
-    └── modeling.py
-
-pretraining/                        # 组合 backbone、目标分支、head 和 loss
-├── jepa/
-├── contrastive/
-├── masked_code/
-└── objectives/                     # SIGReg 等可复用目标项
-
-world_model/                        # 后续：历史 latent → 未来 latent
-
-configs/backbone/base.yaml          # 可直接加载的第一版网络配置
-notebooks/backbone_step_by_step.ipynb # 15个代码单元：输入、各层、梯度、重载
-scripts/check_backbone_notebook.py   # 无界面执行 notebook，可选 --real / --device cuda
-tests/test_backbone.py              # shape、泄漏、梯度、时序与非法配置
-```
-
-`architectures` 只接收通用序列，不识别 PSG 业务轴。CNN 和 Transformer 是可替换算法家族；Attention、FFN 属于 Transformer 内部。它对外提供保形的 sequence blocks，并为 Fusion 提供 `CrossAttentionBlock`。`modeling` 负责 PSG 的 B/C/N/L 轴、mask、时间映射和调用顺序。`factory.py` 只在构建时选择网络；forward 不读取 YAML。`BackboneConfig.to_dict/from_dict` 用于 YAML 与 checkpoint。
-
-当前 `world_model/ssl` 保留为已有最小基线，等新 backbone 接口稳定后再迁移。
-
-## 2. 模块组合
+## 数据与调用关系
 
 ```text
-PSGBackbone
-├── modality_encoders: ModuleDict[str, ModalityEncoder]
-│   └── ModalityEncoder
-│       ├── SignalEncoder
-│       │   ├── Patchifier
-│       │   ├── MaskApplier
-│       │   ├── PatchEncoder
-│       │   │   ├── input projection / patch 内位置编码
-│       │   │   ├── ModuleList[SequenceBlock]
-│       │   │   └── patch 内 readout / output projection
-│       │   └── PatchSequenceEncoder
-│       │       ├── patch 时间编码
-│       │       └── ModuleList[SequenceBlock]
-│       └── ChannelAggregator
-│           └── 通道身份编码 + masked mean/attention readout
-└── fusion: Fusion | None
-    └── 模态身份编码 + 时间对齐 + pool/注入的 CrossAttentionBlock
+SignalBatch：各模态 [B,1,C_m,6000]，epoch data_valid [B,C_m,1]
+  │
+  ├─ online：在原始输入上应用 MaskPlan
+  │   → 1秒 patch [B,C_m,30,200]
+  │   → tokenizer [B,C_m,30,256]
+  │   → 独立 modality encoder ×4
+  │   → channel attention pool → 各模态 [B,30,256]
+  │   → stack [B,G,30,256]
+  │   → modality-time attention + shared/private/routed MoE ×4
+  │   → 保留融合 token [B,G,30,256]
+  │       ├─ 各模态 predictor → 各模态预测 [B,30,256]
+  │       └─ masked mean over G、N → 下游 [B,256]
+  │
+  └─ target（干净输入，无梯度）：EMA modality encoders
+      → channel attention pool → 各模态目标 [B,30,256]
+      → 沿 D 做 LayerNorm，作为被遮挡位置的预测目标
 ```
 
-| 类 | 输入 → 输出 | 负责的轴 |
+`B` 是来源样本数，`C_m` 是模态通道槽位数，`G` 是实际输入模态数，
+`N` 是整秒 token 数，`P=200` 是每秒原始采样点，`D=256` 是 latent 维度。
+P 和 D 没有数值对应关系。backbone 仍支持 N=1–30；本轮预训练固定 N=30。
+
+`data_valid` 由 dataloader 在 CPU 一次生成：epoch 存在、通道存在、覆盖完整、
+处理成功、artifact QC 通过。任何一项失败，整个 epoch 的该通道都无效，
+不重新做 1 秒 QC。`night_grade` 只用于筛选和组成 batch，目前仅 Outstanding。
+
+- `data_valid`：不可被增强改变的数据事实。
+- `visible`：在线模型可读的位置。
+- `target_mask`：待预测的位置，与数据有效性单独保存。
+- attention key/value、pooling 使用 `active = broadcast(data_valid) & visible`。
+- loss 只包含干净目标有效、被选中预测且仍有可见上下文的位置。
+- 全无效 view 排除；不足两个有效来源样本时跳过更新，包括 EMA 更新。
+
+## Backbone
+
+CNN 默认三层，可通过 YAML layers 列表配置：
+
+| 层 | 参数 | 输出 |
 |---|---|---|
-| Patchifier | `[B,E,C,S] → [B,C,N,L]` | 将波形切为 patch |
-| PatchEncoder | `[B,C,N,L] → [B,C,N,D]` | 每个通道、每个 patch 内部 |
-| PatchSequenceEncoder | `[B,C,N,D] → [B,C,N,D]` | 同一通道的相邻 patch |
-| ChannelAggregator | `[B,C,N,D] → [B,N,D]` | 同一时间位置的通道 |
-| Fusion | `dict[m,[B,N_m,D]] → [B,N_joint,D]` | 不同模态 |
-| SignalEncoder | SignalGroup → patch_tokens/local | 组合两个 patch 编码阶段 |
-| ModalityEncoder | SignalGroup → features | SignalEncoder + 通道汇聚 |
-| PSGBackbone | SignalBatch → BackboneOutput | 多模态调度和输出选择 |
+| Conv1 | 1→32，K49，S25，P24，GN8，GELU | [BCN,32,8] |
+| Conv2/3 | 32→32，K3，S1，P1，GN8，GELU | [BCN,32,8] |
+| flatten + LN | 32×8=256 | [B,C,N,256] |
 
-同组通道共享网络权重；不同编码组默认使用独立参数。任何参数共享都必须显式配置。
+Conv3 单位置感受野 149 samples=745ms；flatten 汇总完整 1 秒 patch。
+不同模态 tokenizer 参数独立，同一模态跨通道、views 共享参数。
+SpO₂ 保留已批准数值路径：CPU `(百分数−95)/5`，每秒均值→1→32→256 MLP，
+不做逐 patch 归一化。HF 输入需在模型外完成同样预处理。
 
-## 3. 输入数据与维度
+- EEG/EOG/EMG/respiratory 多通道：Channel-Time Criss-Cross ×4。
+  D=128 channel +128 temporal，每支4 heads，head_dim32，Dense FFN1024。
+- ECG/SpO₂ 单通道：Temporal ×4，8 heads，FFN1024，不建立 channel attention。
+- 模态编码器出口沿 D 做无 affine LN；channel attention pooling 保留。
+- Fusion ×4：128 modality +128 temporal，SDPA，每支4 heads。
+  **FFN 换成 MoE，attention 仍负责跨模态交换信息。**
+- 本轮不增加 post-fusion temporal block。
 
-统一符号：
+每层 MoE 包含一个共享专家、每个配置模态一个专属专家、4个 routed experts，top-1。
+专家为 SwiGLU，hidden=256。共享和专属分支始终计算，路由只计算选中的专家。
+输出为三个分支之和除以3；top-1保留完整softmax门值，保证 router 接收预测梯度。
+路由使用FP32并有负载均衡损失，不采用容量丢弃 token。
+这是 DeepSeek 思路的 PSG 扩展，不是原版 DeepSeek 的复现：固定 modality-private
+专家与 token-routed expert 不等价。小专家循环允许，不能逐样本/通道/时间循环。
+稀疏dispatch存在动态索引开销，速度需以实际GPU测试为准。
 
-| 符号 | 含义 | 第一版示例 |
-|---|---|---:|
-| B | batch 中的窗口数 | 8 |
-| E | 每个窗口的 epoch 槽位数 | 20 |
-| C | 当前编码组通道数 | 1、2、3 或 6 |
-| S | 每通道每 epoch 的采样点数 | 6000 |
-| L | 每个 patch 的采样点数 | 200 |
-| N | 每个窗口的 patch 数 | 600 |
-| P | patch 内子片段数 | 10 |
-| H | architecture 内部维度 | 64 |
-| D | backbone 对外特征维度 | 128 |
-| Q | 一个上下文块内的 patch 数 | 30 |
-| W | 每个窗口的上下文块数，逐 epoch 分块后相加 | 20 |
-| K | codebook 大小 | 由预训练配置决定 |
-| Z | 对比学习 projector 的输出维度 | 由预训练配置决定 |
-| M、T | architecture 的独立序列数与序列长度 | patch 内为 B×C×N、P |
+本轮预测损失不经过汇总 readout，因此 modality 和 temporal readout 采用 masked mean，
+避免下游使用未被训练的 attention query。通道池化仍由预测损失训练。
 
-当前 HSP 为 200 Hz、30 秒 epoch，因此 `S=200×30=6000`。采用 1 秒、不重叠 patch 时：
+可用 `readout.preferred_modalities: [eeg, eog]` 只在最终汇总时优先 EEG/EOG，
+若该位置均无效则回退所有有效模态。六模态仍参与融合与预测；数据覆盖、256D输出和三项下游评价不变。
 
-```text
-L = 200
-N = E × 30 = 600
-P = L / 20 = 10                 # 当 subpatch_samples=20
-Q = 30                          # 30秒上下文
-W = N / Q = E = 20
-```
+## 预训练目标
 
-Reader 返回五个存储组；dataloader adapter 将 SpO₂ 从 respiratory 中拆出，提供六个编码组：
+两个遮挡 views 使用同一 online backbone；EMA 仅复制 modality encoders（含 tokenizer、
+channel pool），不复制 fusion。干净目标每个 batch 计算一次；两个在线 views 沿 B 拼接一次 forward。
 
-| 编码组 | 通道 | C | SignalGroup.values |
-|---|---|---:|---|
-| eeg | F3-M2、F4-M1、C3-M2、C4-M1、O1-M2、O2-M1 | 6 | `[B,E,6,6000]` |
-| eog | E1、E2 | 2 | `[B,E,2,6000]` |
-| ecg | ECG | 1 | `[B,E,1,6000]` |
-| emg | Chin1-Chin2、LAT、RAT | 3 | `[B,E,3,6000]` |
-| respiratory | Airflow、Snore | 2 | `[B,E,2,6000]` |
-| spo2 | SpO₂ | 1 | `[B,E,1,6000]` |
+默认每个 view/sample：25% 概率整模态遮挡，随机选择一个有效模态，保留其他模态；
+否则采用各模态独立的局部时间遮挡：3秒连续块，遮挡40%=12秒。只有一个有效模态时
+退回局部遮挡。所有 views 仍在同一30秒时间网格，**不使用原 LeJEPA 的 global/local 裁剪**。
+遮挡发生在在线 tokenizer/temporal encoder 前，不能先完整编码再遮挡。
 
-SignalBatch 的必要字段：
+每个模态使用独立 predictor：模态可学习 query + 30个时间位置，cross-attention读取
+可见的融合 token，再经 FFN512 和 Linear 输出256维。query不能读取目标latent。
 
 ```text
-SignalBatch
-├── groups: dict[str, SignalGroup]
-├── epoch_mask                bool  [B,E]
-├── epoch_in_record           int64 [B,E]
-├── epoch_start_offset_ns     int64 [B,E]
-├── start_sec                 float [B]
-├── duration_sec              float [B]
-├── recording_duration_sec    float [B]
-├── recording_ids             strings，长度 B
-└── night_grade               uint8 [B]，可选；只供筛选/分层
-
-SignalGroup
-├── values                    float32 [B,E,C,S]
-├── coverage_valid            bool    [B,E,C]
-├── processing_valid          bool    [B,E,C]
-├── artifact_valid            bool    [B,E,C]
-├── valid                     bool    [B,E,C]
-├── hard_code                 uint8   [B,E,C]
-├── available_mask            bool    [B,C]
-├── channel_mask              bool    [B,C]
-├── sample_rate_hz            float   [B]
-├── channel_ids               strings，长度 C
-└── units                     strings，长度 C
+L = L_prediction + 0.01 L_SIGReg + 0.01 L_router
 ```
 
-```python
-valid = available_mask[:, None, :] & coverage_valid & processing_valid & artifact_valid
-data_valid = epoch_mask[:, :, None] & valid
-```
+- prediction：逐模态对有效目标位置求256维MSE，再对有目标的模态等权平均。
+  局部/整模态损失另外报告，便于识别无法从其他模态预测的信息。
+- SIGReg：每个 view、每个可见模态的融合token沿时间masked mean，
+  projector 256→512→128；保持 [V,G,B,128]，仅沿有效 B 统计，之后平均 V/G。
+  默认2048 slices、17 knots，关键计算FP32；不把相关时间token当独立样本。
+- EMA decay=.996，只在成功 optimizer.step 后更新。target 始终 eval，无梯度。
+- 历史 LeJEPA 可通过 objective=lejepa 加载/对照，仍无teacher/predictor。
+  新目标名为 modality_jepa，不再将预测损失标为 invariance。
 
-`night_grade`、subject/session、标签和 hard_code 不进入 backbone 数值特征。当前数据没有逐采样点 QC；waveform mask 是训练遮挡，不是质量标注。
-
-## 4. 中间数据契约
+## 文件职责与调试
 
 ```text
-PatchBatch
-├── values                    float [B,C,N,L]
-├── sample_visible            bool  [B,C,N,L]
-├── data_valid                bool  [B,C,N]
-└── layout                    PatchLayout
-
-SequenceState
-├── tokens                    float [M,T,H]
-├── data_valid                bool  [M,T]
-├── visible                   bool  [M,T]
-├── positions                 int64 [M,T]
-├── time_intervals_ns         int64 [M,T,2]
-├── context_intervals_ns      int64 [M,T,2]
-├── available_at_ns           int64 [M,T]
-└── connection_mask           bool  [M,T,T] 或可等价表达的局部规则
-
-TokenGrid
-├── tokens                    float [B,C,N,D]
-├── data_valid                bool  [B,C,N]
-├── visible                   bool  [B,C,N]
-├── coverage                  float [B,C,N]
-├── time_intervals_ns         int64 [B,N,2]
-├── context_intervals_ns      int64 [B,N,2]
-├── available_at_ns           int64 [B,N]
-├── channel_ids               strings，长度 C
-└── patch_layout              PatchLayout
-
-TokenSequence
-├── tokens                    float [B,N,D]
-├── data_valid/visible        bool  [B,N]
-├── coverage                  float [B,N]
-└── time/context/available    与 N 对齐
+backbone/architectures/moe.py             MoE配置、SwiGLU、共享/专属/路由专家
+backbone/architectures/transformer/       通用SDPA、Temporal、CrissCross
+backbone/modeling/foundation.py          模态编码、二维fusion、pooling
+backbone/contracts.py                    BackboneOutput新增fused_features
+backbone/huggingface/                    同一HF config/model/output
+pretraining/modality_jepa/masking.py      配置、MaskPlan采样及RNG恢复
+pretraining/modality_jepa/model.py        目标encoder、predictor、loss和EMA
+pretraining/lejepa/                      历史LeJEPA对照，复用projector
+pretraining/objectives/sigreg.py          共享FP32 SIGReg
+pretraining/factory.py / views.py        统一模型和sampler构建
+pretraining/training.py / evaluation.py  统一训练、评价和日志
+pretraining/checkpoint.py                模型/EMA/优化器/sampler/RNG恢复、HF导出
+pretraining/cli.py                       唯一正式入口
+experiment_logging/                     W&B
+tests/test_pipeline.py                  同一全局调试入口，按objective进入对应流程
+tests/test_modality_jepa.py              泄漏、EMA、缺失数据、路由及恢复测试
 ```
 
-PatchLayout 保存采样率、patch 长度、每 epoch 的 patch 数、原始 epoch/样本索引和时间映射。第一版仅支持逐 epoch、不重叠、可整除的 patch；stride 等于 patch 长度，epoch padding 沿用 epoch_mask。TokenSequence 另含 `support_count[B,N]`，融合时按原始通道数统计 coverage。
+内部沿用 SignalBatch/SignalGroup/PatchBatch/TokenGrid/TokenSequence/MaskPlan，
+`BackboneOutput.fused_features[name]` 是融合后、池化前的 TokenSequence [B,N,D]。
+HF仍支持标准save/load、AutoModel及公开预处理tensor输入；加载环境安装本项目。
+HF导出只包含online backbone，不包含teacher/predictor/projector/任务头。
 
-三类 mask 必须分开：
+所有实验仍用两文件配置。本轮快照：
+`results/foundation/modality_jepa_moe_10k_20260914/psg_training.yaml` 引用同目录 `psg_model.yaml`。
+仓库 `configs/` 保留 LeJEPA 基线默认值，新参数也可通过其 dotted overrides 配置。
 
-| mask | shape | 来源与作用 |
-|---|---|---|
-| data_valid | `[B,C,N]` | dataloader QC/padding，经 Patchifier 映射 |
-| visible | `[B,C,N]` | 任务指定，控制 context 能读取的位置 |
-| target_mask | `[B,C,N]` | 任务指定，控制需要预测的位置 |
-
-```python
-context_mask = data_valid & visible
-loss_mask = target_data_valid & target_mask
+```powershell
+python -B tests/test_pipeline.py --config results/foundation/modality_jepa_moe_10k_20260914/psg_training.yaml --break-at loss training.batch_size=3 evaluation.wandb_mode=disabled
+python -B -m pretraining.cli --config results/foundation/modality_jepa_moe_10k_20260914/psg_training.yaml
 ```
 
-`MaskPlan(stage, visible={group: bool_tensor})` 支持 none/waveform/token，True 表示可见，第一版采用零替换。waveform 遮挡使用 `[B,E,C,S]`，在投影前执行；token 遮挡使用 `[B,C,N]`，在 PatchEncoder 后执行。token 隐藏位置的原始值也预先清零，避免 NaN 梯度；patch 编码彼此独立，因此不会改变可见位置的结果。数据质量与目标资格保留。
+## 训练与评价
 
-时间使用 recording 相对整数纳秒的 `[start,end)`；padding/无贡献为 -1。原始定位不随网络改变，context 区间随连接更新。当前离线 QC 的可用时刻未知，`available_at_ns=-1`；causal 只约束给定输入的 patch 序列，不声明原始数据处理可实时运行。
+10K成功更新，每1K评价和保存；eval_every_seconds=0。B192，CUDA bf16，
+fused AdamW，峰值lr1e-3，5%warmup，cosine至1e-5；原数据划分、RAM和SpO₂处理不变。
+不承诺MoE一定提高F1；此次同时改变SSL目标和fusion，只能评价组合方案，不能据此单独归因。
 
-## 5. 数据流与 shape
+W&B每步记录：总/预测/SIGReg/router损失、逐模态预测损失、local/whole损失与目标数、
+目标表示std、router负载/熵，以及step/batch/epoch-equivalent、LR、梯度、显存。
+每1K同时评价固定train/validation子集：sleep staging五类独立F1/recall/precision/support，
+heart_rate、sao2原单位回归指标；独立充分拟合线性头保持eval_refit命名。
+原 `eval/macro_f1` 仍用于最佳checkpoint选择，绝不使用test集调参。
 
-```text
-SignalGroup.values
-[B,E,C,S]
-    │ waveform mask
-    ▼
-Patchifier
-[B,C,N,L]
-    ▼
-PatchEncoder
-  direct Linear: [B,C,N,L] → [B,C,N,D]
-  sequence path: [B,C,N,L]
-                 → [B×C×N,P,H]
-                 → SequenceBlocks
-                 → patch readout
-                 → [B,C,N,D]
-    │ token mask
-    ▼
-patch_tokens [B,C,N,D]
-    ▼
-PatchSequenceEncoder
-  [B,C,N,D] → [B×C×W,Q,D]
-              → SequenceBlocks
-              → [B,C,N,D]
-    ▼
-local [B,C,N,D]
-    ▼
-ChannelAggregator
-features [B,N,D]
-    ▼
-Fusion（可选）
-joint [B,N_joint,D]
-```
+验证要求：隐藏原始波形不泄漏、部分/全部缺失、所有在线分支梯度、teacher无梯度且只按step更新、
+EMA和sampler精确恢复、CPU/CUDA bf16、实际B192显存/速度、HF roundtrip、完整pytest、相关Ruff。
+实施末尾必须确认 `git diff HEAD -- data_preprocess` 为空。
 
-以 EEG、`B=8,E=20,C=6,S=6000,L=200,P=10,H=64,D=128,Q=30,W=20` 为例：
+真实六模态 B192、RTX4090D bf16 的8步验证：backbone 26,101,888参数，
+EMA 16,913,024参数（冻结），总可训练参数29,861,120；稳定步耗时约0.312秒，
+峰值allocated15.92GiB、reserved17.45GiB。此测量复用已读入的batch，
+不含磁盘、下游probe和周期评价，不能直接等同完整训练速度。
+原始测量保存在本轮结果目录 `gpu_smoke.json`。
 
-| 位置 | shape |
-|---|---|
-| EEG 输入 | `[8,20,6,6000]` |
-| patches | `[8,6,600,200]` |
-| patch 内序列 | `[28800,10,64]` |
-| patch_tokens | `[8,6,600,128]` |
-| 30 秒序列块 | `[960,30,128]` |
-| local | `[8,6,600,128]` |
-| EEG features | `[8,600,128]` |
-| joint（公共时间网格） | `[8,600,128]` |
+## Approval Checklist
 
-第一版 Fusion 要求各模态时间网格完全相同，因此 `N_joint=N`；不一致则明确报错。pool 对同一时间点的有效模态求均值；cross-attention 使用该均值作 query、同一时间点的模态向量作 source，不跨时间融合。序列窗口不跨 epoch，末块不足 Q 时补齐后再还原。
+后续已批准30秒监督适配：`training.task=finetune` 从既有SSL checkpoint初始化，
+仅解冻配置指定的末端 modality/fusion blocks及对应channel pool。分期梯度更新这些层，
+回归任务使用detach特征。`finetuning/model.py → evaluation.py / training.py` 复用原数据契约、
+CLI、checkpoint和HF导出。监督结果使用 `supervised_*`，不替代原冻结探针；新目标为 N1 F1≥0.70。
 
-### 5.1 近似张量大小
+监督适配的可选消融：`train_temporal_readout=true` 解冻已有 TemporalReadout；
+`model.readout.temporal_pooling=attention` 可从 mean checkpoint 迁移，新增 query
+置零以保持初始均值输出。其余权重严格加载，仍输出 `[B,256]`，不增加上下文或网络深度。
+是否用于下一轮正式训练，先由训练集内部对照决定。
+`training.finetuning.train_tokenizers` 可指定参与监督更新的模态 tokenizer，默认空列表；
+例如 `[eeg,eog,emg]` 沿用 backbone 学习率，其他 tokenizer/embedding 保持冻结。
+该消融不增加参数或移除输入模态，但需计入反传到原始波形 CNN 的显存与计算开销。
 
-以下按 float32、只计算单个张量，不包括梯度、优化器状态、临时激活和框架开销：
-
-| 张量 | 元素数 | 大小 |
-|---|---:|---:|
-| 全部15通道原始输入 `[8,20,15,6000]` | 14,400,000 | 54.9 MiB |
-| patches | 与原始输入相同 | view 时不新增存储；复制时再增加54.9 MiB |
-| 全部15通道 patch tokens `[8,15,600,128]` | 9,216,000 | 35.2 MiB |
-| EEG patch 内状态 `[28800,10,64]` | 18,432,000 | 70.3 MiB |
-| 六组 features，各 `[8,600,128]` | 3,686,400 | 14.1 MiB |
-| joint `[8,600,128]` | 614,400 | 2.34 MiB |
-
-若显式保存 attention score，EEG 的4头、30秒窗口对应 `[960,4,30,30]`，约13.2 MiB/层；600个 patch 的全局 attention 对应 `[48,4,600,600]`，约263.7 MiB/层。实现实际切为 Q=30，并使用 PyTorch SDPA；上述是稠密 score 的理论大小，不等于实测峰值显存。
-
-## 6. 调用与通信关系
-
-运行调用方向：
-
-```text
-外部任务
-  → PSGBackbone
-    → ModalityEncoder
-      → SignalEncoder
-        → Patchifier / MaskApplier
-        → PatchEncoder
-          → CNNSequenceBlock / TransformerSequenceBlock
-        → PatchSequenceEncoder
-          → CNNSequenceBlock / TransformerSequenceBlock
-      → ChannelAggregator
-    → Fusion（可选）
-```
-
-| 调用边界 | 输入 | 返回 |
-|---|---|---|
-| 任务 → PSGBackbone | SignalBatch、MaskPlan、outputs 请求 | BackboneOutput |
-| PSGBackbone → ModalityEncoder | 当前 SignalGroup 与共享时间信息 | ModalityOutput |
-| SignalEncoder → PatchEncoder | PatchBatch `[B,C,N,L]` | TokenGrid `[B,C,N,D]` + aux |
-| modeling → architecture | SequenceState `[M,T,H]` | 更新后的 SequenceState + aux |
-| Fusion → CrossAttentionBlock | query/source SequenceState 与对齐约束 | 融合后的 SequenceState + aux |
-| ModalityEncoder → ChannelAggregator | TokenGrid `[B,C,N,D]` | TokenSequence `[B,N,D]` |
-| PSGBackbone → Fusion | `dict[str,TokenSequence]` | joint TokenSequence |
-
-通信规则：
-
-- 所有输入输出使用显式 dataclass/类型，不传共享可变字典。
-- 特征必须与有效性、可见性、时间和布局一起传递。
-- architecture 不导入 dataloader、modeling 或训练任务。
-- modeling 不实现 CNN/Transformer 内部数学结构。
-- factory 可以导入所有实现用于构建；其他模块不反向导入 factory。
-- 第一版的 BackboneOutput.aux 为空，后续 MoE 才扩展辅助输出；loss 在任务侧计算。
-- 未请求的输出阶段可以跳过；被配置禁用的模块不创建、不进入优化器。
-
-## 7. JEPA、对比学习与 Codebook 接入
-
-BackboneOutput 可按需返回：
-
-| 输出 | shape | 用途 |
-|---|---|---|
-| patch_tokens[m] | `[B,C,N,D]` | patch 编码消融、token 目标 |
-| local[m] | `[B,C,N,D]` | JEPA 局部目标、通道级预测 |
-| features[m] | `[B,N,D]` | 单模态 JEPA/对比学习 |
-| joint | `[B,N_joint,D]` | 多模态 JEPA/对比学习 |
-
-JEPA：
-
-```text
-context SignalBatch + MaskPlan
-    → online PSGBackbone
-    → context representation [B,N,D]
-    → predictor [B,N_target,D]
-
-clean target SignalBatch
-    → target PSGBackbone
-    → stop-gradient target [B,N_target,D]
-```
-
-`pretraining/jepa` 拥有 online/target backbone、predictor、target 位置、EMA 和 loss。两个 backbone 使用同一类与配置，参数状态独立。
-
-对比学习：
-
-```text
-view1 → shared PSGBackbone → selected tokens [B,N,D] → task readout [B,D] → projector [B,Z]
-view2 → shared PSGBackbone → selected tokens [B,N,D] → task readout [B,D] → projector [B,Z]
-```
-
-`pretraining/contrastive` 拥有增强、配对、task readout、projector 和 loss。subject/session/recording/time 元数据只用于配对，不进入 backbone 特征。
-
-Masked-code：
-
-```text
-clean target → codebook tokenizer → code_ids [B,C,N]
-masked input → PSGBackbone.local  → predictor logits [B,C,N,K]
-loss mask = code_valid & target_mask
-```
-
-`tokenization/codebook` 拥有码本与 CodebookOutput；`pretraining/masked_code` 拥有 predictor、更新/冻结策略和 loss。CodebookOutput 至少包含 code_ids、valid_mask、PatchLayout 和 codebook_version。第一版 codebook 只生成目标，不进入 context backbone。
-
-## 8. 第一版实现范围
-
-- 实现 dataloader adapter → SignalBatch。
-- 实现 waveform/token 两个遮挡入口。
-- 实现 direct Linear、CNN、Transformer 及混合 blocks 的 PatchEncoder。
-- 实现按30秒真实分块的 PatchSequenceEncoder。
-- 实现通道聚合和可关闭的 Fusion。
-- 实现所有 shape、mask、时间、输出请求和依赖方向测试。
-- 暂不实现 Fast/Slow、跨 epoch 长程编码、MoE、codebook、JEPA、对比训练和未来 latent dynamics。
+- [x] 已获批准：可见信息融合后，预测各模态融合前的latent；局部和整模态遮挡。
+- [x] shared/private/routed MoE放在fusion FFN，保留attention，D256/30秒边界。
+- [x] 干净EMA模态目标、mask先于在线编码、独立predictor、FP32正则。
+- [x] 保留既有QC、Outstanding筛选、SpO₂输入变换和HF接口。
+- [x] 单一训练/调试入口，配置化，W&B记录，10K训练且每1K评价。
+- [x] 最初 modality JEPA 实验从头训练；后续监督适配已获批从已完成的SSL权重初始化，不恢复用户已停止的进程。

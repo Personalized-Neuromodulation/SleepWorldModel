@@ -61,6 +61,10 @@ def synthetic_windows(
                 values[:, -1] = float("nan")
             good = torch.ones(e, c, dtype=torch.bool)
             sample["signals"][name] = values
+            if name == "respiratory":
+                # SpO2 is a slow absolute level, not a zero-centered waveform.
+                values[:, -1] = 95 + 2 * torch.sin(2 * math.pi * 0.025 * time + i)
+                sample["units"][name] = ("a.u.", "a.u.", "%")
             sample["quality"][name] = {
                 "coverage_valid": good.clone(),
                 "processing_valid": good.clone(),

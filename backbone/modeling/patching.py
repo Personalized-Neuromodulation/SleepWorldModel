@@ -18,13 +18,15 @@ class Patchifier(nn.Module):
         b, e, _, s = group.values.shape
         if s % self.patch_samples:
             raise ValueError("epoch samples must be divisible by patch_samples")
-        if not (group.sample_rate_hz == self.sample_rate_hz).all():
-            raise ValueError("sample rate differs from the constructed backbone")
         p = s // self.patch_samples
         offsets = torch.arange(p, device=group.values.device) * self.patch_samples
-        ns = torch.round(offsets.double() * (1e9 / self.sample_rate_hz)).long()
-        start = batch.epoch_start_offset_ns[..., None] + ns
         duration_ns = round(self.patch_samples * 1e9 / self.sample_rate_hz)
+        ns = torch.arange(p, device=group.values.device) * duration_ns
+        start = batch.epoch_start_offset_ns[..., None] + ns
+        if batch.view_start_samples is not None:
+            start = start + batch.view_start_samples[:, None, None] * round(
+                1e9 / self.sample_rate_hz
+            )
         times = torch.stack((start, start + duration_ns), -1)
         times = torch.where(batch.epoch_mask[:, :, None, None], times, -1)
         return PatchLayout(
@@ -38,14 +40,23 @@ class Patchifier(nn.Module):
         )
 
     def forward(
-        self, group: SignalGroup, batch: SignalBatch, sample_visible=None
+        self,
+        group: SignalGroup,
+        batch: SignalBatch,
+        sample_visible=None,
+        *,
+        layout=None,
     ) -> PatchBatch:
-        layout = self.layout(group, batch)
+        layout = self.layout(group, batch) if layout is None else layout
         b, e, c, s = group.values.shape
         p, length = layout.patches_per_epoch, self.patch_samples
-        quality = batch.epoch_mask[:, :, None] & group.valid
-        active = (quality & group.channel_mask[:, None, :])[..., None].expand_as(
-            group.values
+        # The adapter owns QC; the view sampler owns visibility. Only apply them.
+        data_valid, epoch_visible = group.data_valid, group.visible
+        visible = epoch_visible.transpose(1, 2)[..., None].expand_as(group.values)
+        active = (
+            (data_valid & epoch_visible)
+            .transpose(1, 2)[..., None]
+            .expand_as(group.values)
         )
         if sample_visible is not None:
             if (
@@ -53,10 +64,9 @@ class Patchifier(nn.Module):
                 or sample_visible.dtype != torch.bool
             ):
                 raise ValueError("waveform visibility must be bool [B,E,C,S]")
+            visible = visible & sample_visible
             active = active & sample_visible
         values = torch.where(active, group.values, 0.0)
-        if not torch.isfinite(values).all():
-            raise ValueError("nonfinite values in visible, quality-valid signal")
 
         def patches(value):
             return (
@@ -65,7 +75,11 @@ class Patchifier(nn.Module):
                 .reshape(b, c, e * p, length)
             )
 
-        valid = quality.permute(0, 2, 1).repeat_interleave(p, -1)
+        valid = data_valid
         return PatchBatch(
-            patches(values), patches(active), valid, layout, group.channel_ids
+            patches(values),
+            patches(visible),
+            valid,
+            layout,
+            group.channel_ids,
         )

@@ -1,10 +1,9 @@
-"""Self-contained pre-norm Transformer and cross-attention sequence blocks."""
+"""Batched SDPA attention and dense FFN used by Criss-Cross/Temporal blocks."""
 
 from torch import nn
 from torch.nn import functional as F
 
-from ...contracts import SequenceState
-from ..sequence import clean, update_state
+from ..sequence import clean
 from .configuration import TransformerConfig
 
 
@@ -45,43 +44,11 @@ class DenseFFN(nn.Module):
     def __init__(self, dim: int, config: TransformerConfig):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim, dim * config.expansion),
+            nn.Linear(dim, config.ffn_dim),
             nn.GELU(),
             nn.Dropout(config.dropout),
-            nn.Linear(dim * config.expansion, dim),
+            nn.Linear(config.ffn_dim, dim),
         )
 
     def forward(self, tokens):
         return self.net(tokens)
-
-
-class CrossAttentionBlock(nn.Module):
-    def __init__(self, dim: int, config: TransformerConfig):
-        super().__init__()
-        self.query_norm = nn.LayerNorm(dim)
-        self.source_norm = nn.LayerNorm(dim)
-        self.attention = Attention(dim, config)
-        self.ffn_norm = nn.LayerNorm(dim)
-        self.ffn = DenseFFN(dim, config)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, query: SequenceState, source: SequenceState, allowed=None):
-        edges = query.active[:, :, None] & source.active[:, None, :]
-        if allowed is not None:
-            edges = edges & allowed
-        q = clean(query.tokens, query.active)
-        s = clean(source.tokens, source.active)
-        output = q + self.dropout(
-            self.attention(self.query_norm(q), self.source_norm(s), edges)
-        )
-        output = output + self.dropout(self.ffn(self.ffn_norm(output)))
-        return update_state(query, source, output, edges)
-
-
-class TransformerSequenceBlock(nn.Module):
-    def __init__(self, dim: int, config: TransformerConfig):
-        super().__init__()
-        self.block = CrossAttentionBlock(dim, config)
-
-    def forward(self, state: SequenceState) -> SequenceState:
-        return self.block(state, state, state.connection_mask)

@@ -18,11 +18,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--real", action="store_true")
     parser.add_argument("--device", default="cpu", choices=("cpu", "cuda"))
+    parser.add_argument(
+        "--notebook",
+        default="backbone_step_by_step",
+        choices=("backbone_step_by_step", "architecture_debug_walkthrough"),
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    notebook = nbformat.read(
-        root / "notebooks/backbone_step_by_step.ipynb", as_version=4
-    )
+    notebook = nbformat.read(root / f"notebooks/{args.notebook}.ipynb", as_version=4)
     nbformat.validate(notebook)
     manager = KernelManager(kernel_name="python3")
     manager.kernel_spec.argv = [
@@ -37,6 +40,7 @@ def main():
         **os.environ,
         "PSG_NOTEBOOK_REAL": "1" if args.real else "0",
         "PSG_NOTEBOOK_DEVICE": args.device,
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
     try:
         executed = client.execute(cwd=str(root), env=env)
@@ -44,7 +48,7 @@ def main():
         if manager.has_kernel:
             manager.shutdown_kernel(now=True)
         manager.cleanup_resources()
-    name = f"stepwise_{'real' if args.real else 'synthetic'}_{args.device}.ipynb"
+    name = f"{args.notebook}_{'real' if args.real else 'synthetic'}_{args.device}.ipynb"
     target = root / "artifacts" / "backbone" / name
     target.parent.mkdir(parents=True, exist_ok=True)
     nbformat.write(executed, target)

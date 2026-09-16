@@ -2,6 +2,8 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, fields, replace
+from math import isfinite
+from numbers import Real
 
 import torch
 from torch import Tensor
@@ -20,12 +22,28 @@ class SignalGroup:
     sample_rate_hz: Tensor  # [B]
     channel_ids: tuple[str, ...]
     units: tuple[str, ...]
+    data_valid: Tensor  # [B,C,E], source QC & epoch existence, prepared by adapter
 
-    def to(self, device) -> "SignalGroup":
+    @property
+    def visible(self) -> Tensor:
+        """View visibility [B,C,E]; broadcasting channel selection does not run QC."""
+        return self.channel_mask[..., None].expand_as(self.data_valid)
+
+    def to(self, device, non_blocking=False) -> "SignalGroup":
         return replace(
             self,
             **{
-                f.name: getattr(self, f.name).to(device)
+                f.name: getattr(self, f.name).to(device, non_blocking=non_blocking)
+                for f in fields(self)
+                if isinstance(getattr(self, f.name), Tensor)
+            },
+        )
+
+    def pin_memory(self) -> "SignalGroup":
+        return replace(
+            self,
+            **{
+                f.name: getattr(self, f.name).pin_memory()
                 for f in fields(self)
                 if isinstance(getattr(self, f.name), Tensor)
             },
@@ -43,18 +61,39 @@ class SignalBatch:
     recording_duration_sec: Tensor
     recording_ids: tuple[str, ...]
     night_grade: Tensor | None = None
+    view_start_samples: Tensor | None = None  # [B], crop inside source epoch
 
-    def to(self, device) -> "SignalBatch":
+    @property
+    def data_valid(self):
+        """Epoch QC [B,C,E], excluding padding; visibility/dropout stay separate."""
+        return {name: group.data_valid for name, group in self.groups.items()}
+
+    def to(self, device, non_blocking=False) -> "SignalBatch":
         tensors = {
-            f.name: getattr(self, f.name).to(device)
+            f.name: getattr(self, f.name).to(device, non_blocking=non_blocking)
             for f in fields(self)
             if isinstance(getattr(self, f.name), Tensor)
         }
         return replace(
-            self, groups={k: v.to(device) for k, v in self.groups.items()}, **tensors
+            self,
+            groups={k: v.to(device, non_blocking) for k, v in self.groups.items()},
+            **tensors,
         )
 
-    def validate(self) -> None:
+    def pin_memory(self) -> "SignalBatch":
+        """DataLoader pins the already-adapted tensors, including derived QC."""
+        return replace(
+            self,
+            groups={k: v.pin_memory() for k, v in self.groups.items()},
+            **{
+                f.name: getattr(self, f.name).pin_memory()
+                for f in fields(self)
+                if isinstance(getattr(self, f.name), Tensor)
+            },
+        )
+
+    def validate(self, *, foundation=False, input_spec=None) -> None:
+        """Validate once at the data boundary, before GPU transfer when possible."""
         if not self.groups or self.epoch_mask.ndim != 2:
             raise ValueError("nonempty groups and epoch_mask [B,E] required")
         b, e = self.epoch_mask.shape
@@ -119,20 +158,73 @@ class SignalBatch:
                 raise ValueError(f"{name}: valid disagrees with quality masks")
             if (group.channel_mask & ~group.available_mask).any():
                 raise ValueError(f"{name}: unavailable channels cannot be selected")
+            if (
+                group.data_valid.shape != (b, c, e)
+                or group.data_valid.dtype != torch.bool
+            ):
+                raise ValueError(f"{name}: data_valid must be bool [B,C,E]")
+            if not torch.equal(
+                group.data_valid,
+                (group.valid & self.epoch_mask[..., None]).transpose(1, 2),
+            ):
+                raise ValueError(
+                    f"{name}: data_valid disagrees with source epoch/QC masks; rebuild at the data boundary"
+                )
+            active = (group.data_valid & group.visible).transpose(1, 2)
+            if not torch.isfinite(
+                torch.where(active[..., None], group.values, 0.0)
+            ).all():
+                raise ValueError(f"{name}: nonfinite values in valid signal")
             epoch_ns = round(s * 1e9 / float(rate[0]))
-            for row, exists in zip(self.epoch_start_offset_ns, self.epoch_mask):
-                starts = row[exists]
-                if ((starts[1:] - starts[:-1]) < epoch_ns).any():
-                    raise ValueError("real epochs must be ordered and nonoverlapping")
+            starts = self.epoch_start_offset_ns
+            previous = torch.where(self.epoch_mask, starts, -1).cummax(1).values
+            compare = self.epoch_mask[:, 1:] & (previous[:, :-1] >= 0)
+            if (compare & ((starts[:, 1:] - previous[:, :-1]) < epoch_ns)).any():
+                raise ValueError("real epochs must be ordered and nonoverlapping")
+        if foundation or input_spec is not None:
+            from .validation import validate_input_spec
+
+            validate_input_spec(self, input_spec, foundation=foundation)
+
+
+def collate_signal_windows(samples, *, scales=None):
+    """CPU worker boundary: collate and validate before DataLoader pinning.
+
+    Task labels stay alongside the shared SignalBatch for an optional probe.
+    """
+    from .collate import collate_windows
+
+    raw = collate_windows(samples)
+    return {
+        "signal_batch": as_signal_batch(raw, scales=scales, foundation=True),
+        "tasks": raw["tasks"],
+    }
+
+
+def fixed_scale(spec):
+    """Resolve fixed (offset, divisor); numeric specs retain division-only behavior."""
+    if isinstance(spec, Mapping):
+        if set(spec) != {"offset", "divisor"}:
+            raise ValueError("fixed scale requires exactly offset and divisor")
+        offset, divisor = spec["offset"], spec["divisor"]
+    else:
+        offset, divisor = 0.0, spec
+    if any(isinstance(x, bool) or not isinstance(x, Real) for x in (offset, divisor)):
+        raise ValueError("fixed scale offset/divisor must be numbers")
+    if not isfinite(offset) or not isfinite(divisor) or divisor <= 0:
+        raise ValueError("fixed scale requires finite offset and positive divisor")
+    return float(offset), float(divisor)
 
 
 def as_signal_batch(
     batch: Mapping,
     *,
     split_spo2: bool = True,
-    scales: Mapping[str, float] | None = None,
+    scales: Mapping[str, float | Mapping[str, float]] | None = None,
+    foundation: bool = False,
+    input_spec: Mapping | None = None,
 ) -> SignalBatch:
-    """Adapt reader tensors; optional fixed scales divide values (no fitted statistics).
+    """Adapt reader tensors; optional fixed affine scales use no batch statistics.
 
     Quality and identity metadata are sliced together. No source tensor is modified.
     Unrecognized groups are preserved, making this usable by additional datasets.
@@ -158,11 +250,19 @@ def as_signal_batch(
                 else indices
             )
             selected = values[:, :, selection, :]
-            scale = (scales or {}).get(target, 1.0)
-            if not (0 < scale < float("inf")):
-                raise ValueError(f"invalid fixed scale for {target}")
+            offset, scale = fixed_scale((scales or {}).get(target, 1.0))
+            if offset:
+                selected = (selected - offset).div_(scale)
+            elif scale != 1:
+                selected = selected / scale
+
+            def scaled_unit(unit):
+                if offset:
+                    return f"({unit}-{offset:g})/{scale:g}"
+                return unit if scale == 1 else f"{unit}/{scale:g}"
+
             groups[target] = SignalGroup(
-                values=selected if scale == 1 else selected / scale,
+                values=selected,
                 **{
                     key: batch["quality"][name][key][:, :, indices]
                     for key in (
@@ -177,12 +277,11 @@ def as_signal_batch(
                 channel_mask=batch["channel_mask"][name][:, indices],
                 sample_rate_hz=batch["sample_rates"][name],
                 channel_ids=tuple(ids[i] for i in indices),
-                units=tuple(
-                    batch["units"][name][i]
-                    if scale == 1
-                    else f"{batch['units'][name][i]}/{scale:g}"
-                    for i in indices
-                ),
+                data_valid=(
+                    batch["quality"][name]["valid"][:, :, indices]
+                    & batch["epoch_mask"][..., None]
+                ).transpose(1, 2),
+                units=tuple(scaled_unit(batch["units"][name][i]) for i in indices),
             )
     if scales and set(scales) - groups.keys():
         raise ValueError("scales contains unknown encoding groups")
@@ -202,5 +301,5 @@ def as_signal_batch(
             )
         },
     )
-    result.validate()
+    result.validate(foundation=foundation, input_spec=input_spec)
     return result

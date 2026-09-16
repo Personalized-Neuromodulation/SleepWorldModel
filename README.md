@@ -1,5 +1,17 @@
 # SleepWorldModel
 
+本轮新增 **modality JEPA + shared/private/routed MoE fusion**：遮挡后的可见融合token预测各模态融合前的干净EMA目标，输入固定30秒。设计与数据流见 [架构文档](docs/PSG_ARCHITECTURE_PROPOSAL.md)。历史LeJEPA仍可按原配置加载和对照，下面的global/local说明属于LeJEPA。
+
+当前 N1 监督适配的两份配置保存在 `results/finetuning/n1_last2_balanced_10k_20260915/`。用户已批准仅用训练标签更新末端网络层，保持30秒输入；实现与梯度边界见 [finetuning](finetuning/README.md)。训练/单步调试仍共用同一入口：
+
+```powershell
+python -B -m pretraining.cli --config results/finetuning/n1_last2_balanced_10k_20260915/psg_training.yaml
+python -B tests/test_pipeline.py --config results/finetuning/n1_last2_balanced_10k_20260915/psg_training.yaml --break-at loss training.batch_size=8 evaluation.wandb_mode=disabled
+```
+
+每1K成功更新评价train/validation并保存checkpoint，监督分期指标使用 `supervised_*`，按 N1 F1 选择最佳权重，同时报告其他阶段、心率和血氧。原冻结探针结果保留在 `results/foundation/`，不得与监督成绩混用。`configs/`默认仍保留LeJEPA基线；以上配置选择监督适配。
+
+
 HSP 睡眠信号预处理与多模态自监督学习。当前 I0002 数据由 `data_preprocess.i0002_v100` 生成；训练与调试默认通过 `dataloader` 读取这套正式分片。
 
 ## 目录与入口
@@ -12,16 +24,96 @@ HSP 睡眠信号预处理与多模态自监督学习。当前 I0002 数据由 `d
 | [dataloader](dataloader) | 独立的通用数据读取、窗口、QC 与 batch 接口 |
 | [backbone](backbone/README.md) | 连续 PSG 主干：patch 编码、局部序列、通道聚合和模态融合 |
 | [notebooks](notebooks/backbone_step_by_step.ipynb) | 逐步检查主干各层、真实数据、梯度和权重重载 |
-| [world_model](world_model) | 模型、训练与调试 |
+| [pretraining](pretraining/README.md) | 唯一 LeJEPA/SIGReg 训练入口 |
+| [finetuning](finetuning/README.md) | 复用同一 CLI 的监督适配、独立评价与梯度隔离 |
+| [experiment_logging](experiment_logging) | 独立 W&B 日志 |
 | [tests](tests) | 当前预处理及独立功能的回归测试 |
 
 [代码使用依据与清理记录](data_preprocess/CODE_MAP.md) · [原始 H5 接口](#legacy-loader) · [SSL](#training)
 
-独立 backbone 已实现，见 [实现规格](docs/PSG_ARCHITECTURE_PROPOSAL.md) 和 [逐步 notebook](notebooks/backbone_step_by_step.ipynb)。现有 SSL 入口仍使用 `world_model.ssl` 基线；新主干的正式预训练方法后续接入。
+多模态 foundation backbone 与 LeJEPA/SIGReg 已接入，见 [架构与验收](docs/PSG_ARCHITECTURE_PROPOSAL.md)。训练统一使用 `pretraining.cli`，旧 SSL 实现及入口已删除。
+
+## 全局单步调试
+
+从 [tests/test_pipeline.py](tests/test_pipeline.py) 的 `run_pipeline()` 开始。每一阶段保留清晰的局部变量，可在 IDE 设置断点后按 F11 进入调用模块，或使用命令行断点：
+
+```powershell
+python -B tests/test_pipeline.py --device cpu --break-at data
+python -B tests/test_pipeline.py --device cuda --break-at all pretraining.sigreg.num_slices=8
+python -B -m pytest tests/test_pipeline.py tests/test_input_boundary.py -q
+```
+
+断点可选 `data/model/views/backbone/loss/backward/save-load/all`，进入 pdb 后用 `n` 下一行、`s` 进入函数、`c` 继续。数据源统一读取 YAML 的 `data.mode` 和 `data.root`，默认真实数据；合成调试可设置 `data.mode: synthetic`。`--output` 指定调试产物目录。入口只更新一步并保存 HF 权重，输出各层 shape、loss、梯度和重载结果；诊断指标来自当前调试 batch，不是泛化评分。训练与 W&B 评价仍使用下方统一训练入口。
+
+IDE 中直接 Run/Debug `test_global_pipeline` 也可运行：pytest 临时文件默认位于 `artifacts/pytest`，缓存位于 `artifacts/pytest-cache`，无需额外传 `--basetemp`。每次运行使用 pytest 独立编号目录；显式指定的 `--basetemp` 或 `PYTEST_DEBUG_TEMPROOT` 仍优先。
+
+N1 诊断使用同一个入口的 `--mode diagnose`：固定 checkpoint，比较类别加权、MLP、当前30秒内的时间分类头和融合前模态特征。参数位于 `evaluation.diagnostics`，流程与输出见 [诊断说明](pretraining/README.md#n1-checkpoint-diagnosis-independent-30-s)。单步运行 `python -B tests/test_pipeline.py --mode diagnose --break-at features`；完整运行 `python -B -m pretraining.cli --mode diagnose`。诊断结果单独记录，不覆盖原始 `eval/macro_f1`。
+
+输入只在 dataloader 适配阶段验证，再传入 backbone；GPU forward 应用 QC/visibility mask，不重复扫描原始数据或比较时间网格。自行构造 SignalBatch 时，在送入 GPU 前调用 `validate(foundation=True, input_spec=...)`。
+
+`test_pipeline` 的 `data` 断点可分别查看已经保存的 `data_valid` 和当前 `visible`；`views` 断点可观察 dropout 如何改变可见性，同时复用原 QC。`patching.py` 仅应用 mask 和切分 patch，不再组合 epoch/QC 规则。`tests/test_mask_flow.py` 验证这条数据流、padding、NaN 隔离以及全无效 view 排除。
+
+## Foundation backbone 与 LeJEPA
+
+配置分为两个文件：`configs/psg_model.yaml` 保存网络结构、LeJEPA/SIGReg、views 和增强参数；`configs/psg_training.yaml` 保存数据模式/路径、训练和 W&B 设置，并通过 `model_config: psg_model.yaml` 引用前者。CLI 默认读取训练配置，自动合并模型配置；文件引用相对于训练配置所在目录解析。各模态编码器及 Fusion 默认4层；ECG/SpO₂只使用 temporal attention。输入为一个30秒来源 epoch，局部 view 为1–15整秒，同一 batch 内统一长度；输出逐秒256维和汇总256维表示。QC仍按来源epoch/通道判定，坏通道通过mask排除。
+
+评价频率由 `evaluation.eval_every_seconds: 600.0` 控制：每训练10分钟，在下一次成功更新后进行完整train/validation评价、W&B记录和checkpoint保存；评价与保存耗时不计入下一间隔，结束时仍评价。设为0才使用 `eval_every_steps`，训练总步数不受影响。
+
+训练默认使用 CUDA、bf16 和 fused AdamW，SIGReg 保持 FP32。数据读取、适配和 QC 在 CPU 完成；真实 DataLoader 在适配后 pin memory，再异步传输到 GPU。CPU 调试使用 `training.device=cpu`；不支持 bf16 的 GPU 可设置 `training.precision=float32`。模型训练、评价和 `tests/test_pipeline.py` 共用 `pretraining/runtime.py` 的运行配置。
+
+机械硬盘与 128 GB RAM 配置：默认仅 Outstanding，`data.ram_pool.cache_gib: 64.0` 为当前池与预读池的总预算。单后台 Reader 连续读取，RAM 内跨记录混洗，再将 batch 送入 GPU；`training.num_workers: 0` 避免多个进程重复大缓存。内存逐步填充，不预分配全部预算；配置、限制及 W&B 输入指标见 [RAM 读取说明](dataloader/FORMAT.md#hdd--128-gb-ram-训练读取)。单步入口仍是 `tests/test_pipeline.py`。
+
+CNN 层数由 `model.patch_tokenizer.layers` 列表长度决定；每层的 channels/kernel/stride/padding/dilation/bias、归一化、激活和 dropout 均可配置。Criss-Cross、Temporal、Fusion 的 heads 和 FFN 宽度也由 YAML 设置，详见 [backbone 配置说明](backbone/README.md)。`test_pipeline` 同时回归默认网络和非默认网络，并在报告中保存实际模型配置。
+
+SpO₂ 使用独立数值路径：`data.scales.spo2: {offset: 95.0, divisor: 5.0}` 在 CPU 将原始百分数变为 `(SpO₂−95)/5`；`model.numeric_tokenizers.spo2: {hidden_dim: 32, activation: gelu}` 将每个 1 秒 patch 的均值通过 `1→32→256` MLP 编码，不使用逐 patch GroupNorm/LayerNorm。其他模态继续使用 CNN，epoch QC、标签和通道维度保持原定义。旧配置没有 `numeric_tokenizers` 时仍构建原 CNN。HF 公开输入需先完成相同变换，新模型的 SpO₂ 输入单位记录为 `(%-95)/5`，不能直接输入百分数或仅 `/100` 的值。
+
+Readout 默认在 modality encoder 出口沿 D 做无 affine LayerNorm，Fusion 出口保留原值，模态池化使用固定 scale=2 的 cosine 打分。`model.readout` 可独立配置输出归一化与池化方式；数值边界、梯度和小规模任务对照见 [验证报告](results/foundation/readout_validation/REPORT.md)。这不是下游收敛结论，旧 checkpoint 不会自动改用新结构。修改源码后开发环境建议 `python -m pip install -e . --no-deps`，保证其他工作目录下的 HF 加载也使用当前代码。
+
+```powershell
+# 合成数据：一步训练、固定验证集评价、HF导出；不需要HSP文件。
+python -B -m pretraining.cli data.mode=synthetic training.max_steps=1 evaluation.max_batches=1 pretraining.sigreg.num_slices=8 evaluation.wandb_mode=disabled
+
+# 正式数据：设置数据路径，按subject划分；night_grade用于筛选和组batch。
+python -B -m pretraining.cli
+
+# 可覆盖网络深度、loss、增强；每次运行都保存解析后的完整配置。
+python -B -m pretraining.cli data.mode=synthetic training.max_steps=1 model.modality_encoder.eeg_depth=6 pretraining.lejepa.lambda_sigreg=0.05 pretraining.augmentation.channel_dropout_prob=0.2
+```
+
+默认 W&B online，自动读取项目根目录 `.env` 中的 `WANDB_API_KEY`（已有环境变量优先），密钥不写入实验配置。`evaluation.wandb_mode=offline/disabled` 可改为离线或关闭。评价记录 SSL loss、有效 view 比例、embedding 标准差/effective rank；默认 `evaluation.frozen_linear_probe=true`，同时训练并验证 sleep_stage、heart_rate、sao2 的独立线性头，梯度不传回 backbone。心率和血氧回归记录原始单位的 MAE、RMSE、逐字段 R² 与有效样本数；无效字段由 `field_valid` 排除。synthetic 无标签，需设置 `evaluation.frozen_linear_probe=false`。默认输出 `results/foundation/`，其中 `backbone/` 是HF模型、`training.pt`含SSL/优化器状态、`config.json`保存实验配置，`best/`保留最佳验证checkpoint。
+
+当前配置为 **10K训练、每1K评价和保存完整checkpoint**。AdamW使用5%warmup＋余弦衰减；SIGReg按view统计。固定评价原始输入缓存到RAM，独立的`train_refit/*`、`eval_refit/*`报告充分拟合线性头的结果；原`eval/macro_f1`仍用于选择最佳模型。恢复路径可配置为`training.resume_from`，具体说明见[预训练文档](pretraining/README.md#current-10k-training-and-restart)。
+
+脚本调试 `python -B tests/test_pipeline.py` 同样遵循 YAML 的 W&B 模式，在流程完成后上传当前 batch 的 `debug/*`、`debug_batch/*` 指标。pytest 自动测试默认关闭联网；运行 `python -B -m pytest tests/test_pipeline.py --wandb-mode online -s` 开启，IDE 的 pytest 运行配置也可填写 `--wandb-mode online`。
+
+HF加载环境需要安装本项目及其依赖：
+
+```python
+import torch
+from transformers import AutoModel
+
+model = AutoModel.from_pretrained("results/foundation/backbone", trust_remote_code=True)
+model.eval()
+with torch.no_grad():
+    output = model(
+        signals={"ecg": torch.randn(2, 1, 8, 200)},
+        data_valid={"ecg": torch.ones(2, 1, 1, dtype=torch.bool)},  # epoch QC
+    )
+print(output.last_hidden_state.shape)  # [2,8,256]
+print(output.pooler_output.shape)      # [2,256]
+```
+
+调试按以下顺序打开两个notebook：先 [组件单步调试](notebooks/backbone_step_by_step.ipynb)，再 [端到端运行逻辑](notebooks/architecture_debug_walkthrough.ipynb)。修改配置后重新运行构建cell；代码cell调用仓库模块，支持在forward中设置断点。
+
+```powershell
+python -B scripts/check_backbone_notebook.py
+python -B scripts/check_backbone_notebook.py --notebook architecture_debug_walkthrough
+python -B scripts/inspect_foundation.py --device cuda
+```
 
 ## 环境
 
-Python ≥3.11。从仓库根目录运行；安装包包含 backbone、dataloader、world_model 以及预留的 pretraining/tokenization 包。
+Python ≥3.11。从仓库根目录运行；安装包包含 backbone、dataloader、pretraining、experiment_logging。
 
 ```powershell
 Set-Location 'E:\Code\SleepWorldModel'
@@ -34,7 +126,7 @@ $sleepPython = 'C:\Users\user\miniconda3\envs\SleepWM\python.exe'
 
 ## Backbone 单步测试
 
-在 Jupyter/VS Code 打开 `notebooks/backbone_step_by_step.ipynb`，选择 **Python (SleepWM)** kernel，按 Shift+Enter 逐个执行。默认合成数据；参数单元格将 `USE_REAL_DATA=True` 切到 I 盘 HSP，`DEVICE='cuda'` 切换 GPU。每层变量可直接查看，网络块输入通过临时 hook 展示。
+在 Jupyter/VS Code 打开 `notebooks/backbone_step_by_step.ipynb`，选择 **Python (SleepWM)** kernel，按 Shift+Enter 逐个执行。数据模式及路径默认读取 YAML，`DEVICE='cuda'` 使用 GPU；验证脚本通过 `PSG_NOTEBOOK_REAL` 显式覆盖数据模式。每层变量可直接查看，网络块输入通过临时 hook 展示。
 
 ```powershell
 & $sleepPython -m jupyterlab notebooks/backbone_step_by_step.ipynb
@@ -43,7 +135,7 @@ $sleepPython = 'C:\Users\user\miniconda3\envs\SleepWM\python.exe'
 & $sleepPython scripts/check_backbone_notebook.py --real --device cuda
 ```
 
-首次在其他环境使用时，执行 `python -m ipykernel install --user --name sleepwm --display-name "Python (SleepWM)"` 注册 kernel。主干默认配置位于 `configs/backbone/base.yaml`。
+首次在其他环境使用时，执行 `python -m ipykernel install --user --name sleepwm --display-name "Python (SleepWM)"` 注册 kernel。唯一配置入口为 `configs/psg_training.yaml`。已移除旧 backbone 配置和实现，`build_backbone` 始终构建当前 CNN/Criss-Cross 主干。
 
 ## 本地产物与可清理文件
 
@@ -77,18 +169,12 @@ dataloader/           # 独立顶层包，供不同模型复用
 backbone/             # 连续 PSG 表示主干
   architectures/     # CNN、Transformer 等可替换算法家族
   modeling/          # patch、序列、通道、模态编码与组合
-tokenization/         # 可选的离散表示生成器
-  codebook/           # masked-code 等任务使用的码本
 pretraining/          # 组合 backbone、目标分支、head 与 loss
-  jepa/               # online/target backbone 与 predictor
-  contrastive/        # 双视图、projector 与配对目标
-  masked_code/        # 离散 code 预测
+  lejepa/             # 共享 backbone、projector、多视图一致性
+  views.py            # raw crop、通道/模态 dropout
   objectives/         # SIGReg 等可复用目标项
-world_model/
-  ssl/                # 当前最小 SSL 基线，待新 backbone 实现后迁移
-  training/           # 模型专用输入适配、训练和日志
-  debugging/          # 单步调试
-  io/                 # H5 I/O 与源数据复制工具
+experiment_logging/   # 独立 W&B 日志，不依赖模型
+scripts/Copy-HSP-I0002.ps1  # 源数据复制工具
 ```
 
 ```python
@@ -117,24 +203,23 @@ Windows 多进程脚本应把 DataLoader 创建和迭代放入 `if __name__ == "
 - 默认检查大小、提交摘要一致性、绑定及读取窗口的索引；`verify_checksums=True` 额外在打开文件时校验整文件 SHA256，有额外 I/O 成本。
 - 数据划分由 `dataset + subject_id + split_seed` 的稳定哈希决定，同一 subject 的所有 session 在同一 split。默认 80/10/10，是哈希分配概率而非精确计数；不写回发布文件，也不沿用旧 raw manifest 的划分。
 
-正式分片训练入口：
+在 `configs/psg_training.yaml` 中选择数据源：
 
-```powershell
-& $sleepPython -m world_model.training.ssl_cli `
-  --dataset hsp --version v1.0.0 `
-  --root 'I:\HSP\I0002-preprocess\processed\v1.0.0' `
-  --split train --split-seed 42 --split-ratios 0.8 0.1 0.1 `
-  --context-epochs 20 --batch-size 2 --num-workers 2 `
-  --device cuda --wandb-mode disabled
+```yaml
+data:
+  mode: real  # real：正式数据；synthetic：合成调试数据
+  root: 'I:\HSP\I0002-preprocess\processed\v1.0.0'
 ```
 
-训练从数据元信息构造输入配置，保留发布数据的五组模态：EEG 6、EOG 2、ECG 1、EMG 3、respiratory 3，全部 200 Hz。respiratory 内含 Airflow、Snore、SpO2。
+CLI 默认直接读取该配置，PyCharm 参数可留空：
 
-QC 按每个 epoch、每个通道生效；一个坏 epoch 不影响该通道的其他有效 epoch。无效通道先置零，整组无效时屏蔽该模态的特征，所有模态均无效的 epoch 不参与损失。
+```powershell
+& $sleepPython -m pretraining.cli
+```
 
-`dataloader` 不导入 `world_model` 或预处理代码，其他模型可直接复用它。模型输入适配位于 `world_model/training/batch_adapter.py`。完整接口见 [读取接口契约](dataloader/FORMAT.md)。模型根据元信息建立卷积输入层；改变通道布局需要重新建立模型，不能直接套用旧权重。
+适配在 `dataloader/signals.py` 完成，将 respiratory 中的 SpO₂ 拆为独立编码组；QC 保持来源 epoch/通道粒度。其他模型可直接复用 dataloader，无需导入训练包。接口见 [读取接口契约](dataloader/FORMAT.md)。
 
-Python 包名为 `world_model`，项目分发名称保留 `sleep-world-model`；运行 `python -m pip install -e . --no-deps` 可刷新本机安装入口。
+项目分发名称仍为 `sleep-world-model`。重新安装后仅保留训练命令 `train-psg-foundation`，它与 `python -m pretraining.cli` 调用同一个 `main`；数据 manifest 工具独立保留。
 
 新增数据集时，实现 `Reader` 协议的 metadata、records、read_window、close，并用 `register_reader("name", ReaderClass)` 注册；记录元数据包含 recording_id、subject_id、session_id 和 n_epochs，窗口字典遵循 hsp.py 的输出字段及张量形状。同格式的数据复用读取器，不按 cohort 复制代码；新格式或 schema 必须明确实现并验证，不能仅改版本字符串。注册应在入口创建 Dataset 前完成。只有当前 HSP 发布读取器已用真实数据验证。
 
@@ -237,59 +322,11 @@ Windows 下将带多 worker 的可执行脚本入口放在 `if __name__ == "__ma
 `normalization="zscore"`、`"robust"` 在当前样本/context 内计算，可能消除跨夜幅度差异；默认 `none`。若需整夜统计归一化，可通过明确设计的 transform 提供。
 
 <a id="training"></a>
-## SSL 模型、训练与调试
+## 训练与调试
 
-当前基线为小型 CNN、两视图一致性损失和 SIGReg。实现与 Review 记录见 [SSL 模块说明](world_model/ssl/SSL.md)。
-
-每个 30 秒 epoch 独立编码：各模态经过两层一维卷积与全局池化，拼接后生成 embedding，再经过共享投影头。训练时对同一 epoch 做两次随机时间裁剪，默认保留 80%；同一视图内各模态按相对时间对齐。模型内部使用 `sign(x) * log1p(abs(x))` 压缩幅度，读取器和磁盘上的物理值保持原样。
-
-损失只有两项：`(1 − λ) × MSE(z1, z2) + λ × (SIGReg(z1) + SIGReg(z2)) / 2`，默认 λ=0.05。SIGReg 将随机单位方向上的投影分布约束到标准高斯，采用特征函数和梯形积分计算。每个 batch 至少需要两个有效 epoch；不足时明确报错。SIGReg 始终使用 FP32，CUDA 编码器训练使用 BF16。
-
-`context-epochs` 控制一次读取的窗口大小；当前模型不学习 epoch 之间的时序关系。用于下游任务的完整 epoch 表示来自 `model.encode(batch)`，形状为 `[batch, epochs, embedding_dim]`，并返回有效 epoch mask。
-
-### 训练
-
-```powershell
-& $sleepPython -m world_model.training.ssl_cli `
-  --root 'I:\HSP\I0002-preprocess\processed\v1.0.0' `
-  --context-epochs 20 --batch-size 8 --num-workers 2 `
-  --max-steps 1000 --device cuda --wandb-mode disabled
-```
-
-默认使用 AdamW、固定学习率 0.001、梯度裁剪 1.0。可通过 `--hidden-dim`、`--embedding-dim`、`--projection-dim` 调整模型大小；默认分别为 32、128、64。SIGReg 默认 256 个方向、17 个积分点，分别由 `--sigreg-projections` 和 `--sigreg-frequencies` 控制。完整参数运行 `--help` 查看。
-
-W&B 默认关闭；`--wandb-mode offline` 在 `artifacts/wandb` 保存日志，`online` 在配置凭据后上传。训练记录总损失、一致性损失、SIGReg、embedding 标准差、梯度范数、学习率和有效 epoch 数。
-
-默认权重路径为 `artifacts/checkpoints/ssl_minimal.pt`，保存模型配置、读取配置、损失配置、模型及优化器状态。新版 schema 3 / `minimal-sigreg-v1` 与旧层级 SSL 权重不兼容；旧权重保留在原位置。当前入口从头训练，不提供断点续训参数。
-
-### 调试与提取表示
-
-调试入口读取一个 batch，执行 forward、loss、backward，不更新参数或保存权重。不带参数时使用合成数据。
-
-```powershell
-& $sleepPython -m world_model.debugging.ssl_step --synthetic
-& $sleepPython -m world_model.debugging.ssl_step `
-  --root 'I:\HSP\I0002-preprocess\processed\v1.0.0' `
-  --context-epochs 4 --batch-size 2 --break-at model
-```
-
-断点支持 `batch/model/loss/backward/none`；`--forward-only` 跳过反向传播。也可在 IDE 中调试对应模块。
-
-```python
-import torch
-from dataloader import WindowDataset, collate_windows
-from world_model.ssl import SSLConfig, SSLModel
-from world_model.training.batch_adapter import prepare_batch
-
-saved = torch.load("artifacts/checkpoints/ssl_minimal.pt", map_location="cpu", weights_only=False)
-model = SSLModel(SSLConfig(**saved["model_config"]))
-model.load_state_dict(saved["model"])
-model.eval()
-with WindowDataset(r"I:\HSP\I0002-preprocess\processed\v1.0.0", context_epochs=4) as dataset:
-    batch = prepare_batch(collate_windows([dataset[0]]), model.config, torch.device("cpu"))
-    with torch.no_grad():
-        embeddings, valid = model.encode(batch)
-```
+训练使用 [pretraining.cli](pretraining/cli.py)，配置使用 `configs/psg_training.yaml`，详见 [预训练说明](pretraining/README.md)。
+`tests/test_pipeline.py` 和 notebook 调用同一套模型、loss、runtime 与日志组件，提供逐步调试，不保留第二套 SSL 实现。
+历史最小 SSL checkpoint 保留为实验产物，当前模型不加载该格式。
 
 ## 测试
 

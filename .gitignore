@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 .idea/
 artifacts/
+results/
 artifacts/*.jsonl
 artifacts/*.tmp
 artifacts/checkpoints/

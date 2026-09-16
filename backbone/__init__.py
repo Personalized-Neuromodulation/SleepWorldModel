@@ -1,24 +1,16 @@
 """Reusable continuous PSG features, independent of pretraining objectives."""
 
-from .configuration import (
-    BackboneConfig,
-    BlockConfig,
-    PatchEncoderConfig,
-    SequenceEncoderConfig,
-)
+from .configuration import BackboneConfig
 from .contracts import BackboneOutput, MaskPlan, TokenGrid, TokenSequence
 from .factory import build_backbone
-from .modeling.psg_backbone import PSGBackbone
+from .modeling.foundation import FoundationBackbone
 
 __all__ = [
     "BackboneConfig",
-    "BlockConfig",
-    "PatchEncoderConfig",
-    "SequenceEncoderConfig",
     "BackboneOutput",
     "MaskPlan",
     "TokenGrid",
     "TokenSequence",
-    "PSGBackbone",
+    "FoundationBackbone",
     "build_backbone",
 ]

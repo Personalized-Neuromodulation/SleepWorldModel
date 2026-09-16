@@ -32,9 +32,15 @@ class WindowDataset(Dataset):
         stride_epochs: int | None = None,
         drop_last: bool = False,
         tasks: tuple[str, ...] = (),
+        night_grades: tuple[int, ...] | None = None,
         **reader_options,
     ):
         stride = context_epochs if stride_epochs is None else stride_epochs
+        if night_grades is not None and (
+            not night_grades
+            or any(type(g) is not int or g not in range(1, 6) for g in night_grades)
+        ):
+            raise ValueError("night_grades must select integer grades 1–5")
         if context_epochs <= 0 or stride <= 0:
             raise ValueError("context_epochs and stride_epochs must be positive")
         if split not in (None, "train", "validation", "test"):
@@ -58,6 +64,11 @@ class WindowDataset(Dataset):
         self.records, self._ends = [], []
         total = 0
         for record in self.reader.records:
+            if (
+                night_grades is not None
+                and record.get("night_grade") not in night_grades
+            ):
+                continue
             if (
                 split is not None
                 and subject_split(

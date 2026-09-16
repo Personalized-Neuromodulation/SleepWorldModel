@@ -15,9 +15,6 @@ from torch.utils.data import DataLoader
 from dataloader import WindowDataset, collate_windows, register_reader
 from dataloader.readers.hsp import CHANNELS, QUALITY, TASKS
 from dataloader.sampler import subject_split
-from world_model.ssl import SSLConfig, SSLLoss, SSLModel
-from world_model.training.batch_adapter import prepare_batch
-from world_model.training.input import model_input_config
 
 
 def _write_json(path, value):
@@ -303,100 +300,210 @@ def test_reader_extension_without_editing_training_or_indexing(release):
 
 
 def test_published_batch_model_forward_backward_and_qc(release):
-    torch.set_num_threads(1)
-    with WindowDataset(release, context_epochs=2) as ds:
-        batch = collate_windows([ds[0], ds[1]])
-        config = SSLConfig(
-            **model_input_config(ds.metadata),
-            hidden_dim=8,
-            embedding_dim=16,
-            projection_dim=8,
-        )
-        prepared = prepare_batch(batch, config, torch.device("cpu"))
-        assert config.channels["emg"] == 3 and config.channels["respiratory"] == 3
-        assert config.sample_rates["respiratory"] == 200
-        assert prepared["valid"]["eeg"][0, 0, 0]
-        assert not prepared["valid"]["eeg"][0, 1, 0]
-        assert not prepared["signals"]["eeg"][0, 1, 0].any()
-        assert not prepared["valid"]["eeg"][1, 1].any()
-        model = SSLModel(config)
-        loss = SSLLoss(num_projections=4, num_frequencies=5)(model(prepared)).total
-        loss.backward()
-        assert torch.isfinite(loss)
-        assert model.projector[0].weight.grad is not None
+    from dataloader import as_signal_batch
+    from pretraining.factory import build_pretraining
+    from tests.test_foundation import small_config
+
+    torch.set_num_threads(2)
+    with WindowDataset(release, context_epochs=1) as dataset:
+        raw = collate_windows([dataset[0], dataset[1]])
+        raw["signals"]["eeg"][1, 0, 0] = float("nan")
+        batch = as_signal_batch(raw, foundation=True)
+        assert batch.groups["emg"].values.shape[2] == 3
+        assert batch.groups["respiratory"].values.shape[2] == 2
+        assert batch.groups["spo2"].values.shape[2] == 1
+        assert not batch.groups["eeg"].data_valid[1, 0].any()
+        model, sampler = build_pretraining(small_config(), batch)
+        output = model(sampler(batch))
+        assert not output.skip_update and torch.isfinite(output.loss)
+        output.loss.backward()
+        assert model.projector[0].weight.grad.abs().sum() > 0
 
 
 def test_training_cli_reads_release_and_writes_checkpoint(release, tmp_path):
-    from world_model.training.ssl_cli import main
+    import yaml
+    from transformers import AutoModel
 
-    torch.set_num_threads(1)
-    checkpoint = tmp_path / "model.pt"
-    assert (
-        main(
-            [
-                "--root",
-                str(release),
-                "--split",
-                "all",
-                "--device",
-                "cpu",
-                "--max-steps",
-                "1",
-                "--batch-size",
-                "2",
-                "--context-epochs",
-                "2",
-                "--embedding-dim",
-                "16",
-                "--projection-dim",
-                "8",
-                "--hidden-dim",
-                "8",
-                "--sigreg-projections",
-                "4",
-                "--sigreg-frequencies",
-                "5",
-                "--wandb-mode",
-                "disabled",
-                "--checkpoint",
-                str(checkpoint),
-            ]
-        )
-        == 0
+    from pretraining.cli import main
+    from pretraining.configuration import load_config
+
+    output_dir = tmp_path / "foundation"
+    config = load_config(
+        overrides=[
+            "data.mode=real",
+            f"data.root={release}",
+            "data.split_seed=9",  # fixture: subject-a train, subject-b validation
+            "data.night_grades=[1,5]",  # Validation fixture intentionally has grade 1.
+            f"training.output_dir={output_dir}",
+            "training.device=cpu",
+            "training.max_steps=1",
+            "training.readout_log_every_steps=1",
+            "training.batch_size=2",
+            "model.modality_encoder.eeg_depth=1",
+            "model.modality_encoder.multichannel_depth=1",
+            "model.modality_encoder.single_channel_depth=1",
+            "model.fusion.depth=1",
+            "pretraining.sigreg.num_slices=8",
+            "evaluation.max_batches=1",
+            "evaluation.wandb_mode=disabled",
+        ]
     )
-    saved = torch.load(checkpoint, weights_only=False)
-    assert saved["schema_version"] == 3
-    assert saved["architecture"] == "minimal-sigreg-v1"
-    assert saved["input_config"]["dataset"] == "hsp"
-    assert saved["model_config"]["channels"]["emg"] == 3
-    restored = SSLModel(SSLConfig(**saved["model_config"]))
-    restored.load_state_dict(saved["model"])
-    with WindowDataset(release, context_epochs=2) as ds:
-        sample = prepare_batch(
-            collate_windows([ds[0]]), restored.config, torch.device("cpu")
-        )
-        embeddings, valid = restored.encode(sample)
-        assert embeddings.shape == (1, 2, 16) and valid.all()
-
-
-def test_debug_cli_runs_one_real_format_batch(release):
-    from world_model.debugging.ssl_step import main
-
-    torch.set_num_threads(1)
-    assert (
-        main(
-            [
-                "--root",
-                str(release),
-                "--split",
-                "all",
-                "--device",
-                "cpu",
-                "--context-epochs",
-                "2",
-                "--batch-size",
-                "2",
-            ]
-        )
-        == 0
+    config_path = tmp_path / "real.yaml"
+    model_path = tmp_path / "model.yaml"
+    model_path.write_text(
+        yaml.safe_dump({key: config[key] for key in ("model", "pretraining")}),
+        encoding="utf-8",
     )
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model_config": model_path.name,
+                **{key: config[key] for key in ("data", "training", "evaluation")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert main(["--config", str(config_path)]) == 0
+    saved = torch.load(output_dir / "training.pt", weights_only=True)
+    assert saved["step"] == 1
+    assert "train/readout/modality_entropy" in saved["metrics"]
+    assert "eval/readout/fused_feature_norm" in saved["metrics"]
+    assert saved["config"]["data"]["dataset"] == "hsp"
+    restored = AutoModel.from_pretrained(
+        output_dir / "backbone", trust_remote_code=True
+    )
+    with torch.no_grad():
+        result = restored(signals={"ecg": torch.randn(2, 1, 5, 200)})
+    assert result.pooler_output.shape == (2, 256)
+
+
+def test_foundation_grade_filter_and_batch_composition(release):
+    from dataloader.sampler import NightGradeBatchSampler
+
+    with WindowDataset(release, context_epochs=1, night_grades=(5,)) as dataset:
+        assert all(r["night_grade"] == 5 for r in dataset.records)
+        assert len(dataset) == 5
+    with WindowDataset(release, context_epochs=1) as dataset:
+        sampler = NightGradeBatchSampler(dataset, batch_size=3, num_batches=20, seed=8)
+        batches = list(sampler)
+        assert batches == list(sampler)
+        grades = set()
+        for indices in batches:
+            batch = collate_windows([dataset[i] for i in indices])
+            assert len(batch["night_grade"].unique()) == 1
+            grades.add(int(batch["night_grade"][0]))
+        assert grades == {1, 5}
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_foundation_training_real_schema_with_linear_probe(release, tmp_path, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from pretraining.configuration import load_config
+    from pretraining.training import train
+
+    torch.set_num_threads(2)
+    config = load_config(
+        overrides=[
+            f"training.device={device}",
+            "model.modality_encoder.eeg_depth=1",
+            "model.modality_encoder.multichannel_depth=1",
+            "model.modality_encoder.single_channel_depth=1",
+            "model.fusion.depth=1",
+            "pretraining.sigreg.num_slices=8",
+            "training.max_steps=1",
+            "evaluation.frozen_linear_probe=true",
+            "evaluation.wandb_mode=disabled",
+            "evaluation.max_batches=1",
+        ]
+    )
+    config["training"]["output_dir"] = str(tmp_path / "foundation")
+    with WindowDataset(release, context_epochs=1, tasks=TASKS) as dataset:
+        train_batch = collate_windows([dataset[0], dataset[1]])  # subject-a
+        val_batch = collate_windows([dataset[3], dataset[4]])  # subject-b
+        result = train(config, [train_batch], [val_batch])
+    assert result["steps"] == 1
+    assert result["metrics"]["eval/probe_samples"] == 1
+    assert result["metrics"]["train_eval/probe_samples"] == 2
+    assert 0 <= result["metrics"]["eval/macro_f1"] <= 1
+    for task in ("heart_rate", "sao2"):
+        assert result["metrics"][f"train_eval/{task}/samples"] == 2
+        assert result["metrics"][f"train_eval/{task}/mae"] >= 0
+        assert result["metrics"][f"eval/{task}/samples"] == 1
+        assert result["metrics"][f"eval/{task}/mae"] >= 0
+        assert result["metrics"][f"eval/{task}/rmse"] >= 0
+    checkpoint = torch.load(tmp_path / "foundation/training.pt", weights_only=True)
+    assert set(checkpoint["probe"]) == {
+        f"heads.{task}.{parameter}"
+        for task in TASKS
+        for parameter in ("weight", "bias")
+    }
+
+
+def test_pipeline_debugs_all_three_tasks(release, tmp_path, monkeypatch):
+    import test_pipeline
+
+    from pretraining.configuration import load_config
+
+    config = load_config(
+        overrides=[
+            f"data.root={release}",
+            "data.split_seed=9",
+            "training.device=cpu",
+            "training.batch_size=2",
+            "model.modality_encoder.eeg_depth=1",
+            "model.modality_encoder.multichannel_depth=1",
+            "model.modality_encoder.single_channel_depth=1",
+            "model.fusion.depth=1",
+            "pretraining.sigreg.num_slices=8",
+            "evaluation.max_batches=1",
+            "evaluation.wandb_mode=disabled",
+        ]
+    )
+    logged = {}
+    monkeypatch.setattr(
+        test_pipeline.WandbLogger,
+        "log",
+        lambda self, metrics, step: logged.update(metrics),
+    )
+    report = test_pipeline.run_pipeline(config, tmp_path / "pipeline")
+    assert report["hf_roundtrip"]
+    assert "debug_batch/macro_f1" in logged
+    for task in ("heart_rate", "sao2"):
+        assert logged[f"debug_batch/{task}/samples"] > 0
+        assert logged[f"debug_batch/{task}/mae"] >= 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@pytest.mark.parametrize("workers", [0, 1])
+def test_foundation_worker_adapter_pins_derived_tensors(release, workers):
+    from dataclasses import fields
+    from functools import partial
+
+    from torch.utils.data import DataLoader
+
+    from dataloader.signals import collate_signal_windows
+    from pretraining.evaluation import prepare
+
+    with WindowDataset(release, context_epochs=1, tasks=("sleep_stage",)) as dataset:
+        loader = DataLoader(
+            dataset,
+            batch_size=2,
+            num_workers=workers,
+            collate_fn=partial(collate_signal_windows, scales={"eeg": 2.0}),
+            pin_memory=True,
+        )
+        raw = next(iter(loader))
+        batch = raw["signal_batch"]
+        assert raw["tasks"]["sleep_stage"]["labels"].is_pinned()
+        for obj in [batch, *batch.groups.values()]:
+            assert all(
+                getattr(obj, f.name).is_pinned()
+                for f in fields(obj)
+                if isinstance(getattr(obj, f.name), torch.Tensor)
+            )
+        moved = prepare(raw, torch.device("cuda"))
+        assert moved.groups["eeg"].data_valid.device.type == "cuda"
+        torch.testing.assert_close(
+            moved.groups["eeg"].values.cpu(), batch.groups["eeg"].values, equal_nan=True
+        )
